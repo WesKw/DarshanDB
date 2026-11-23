@@ -1,7 +1,5 @@
 CREATE TABLE jobs (
-    log_hash varchar,
-    jobid BIGINT,
-    uid_hash VARCHAR,
+    jobid BIGINT PRIMARY KEY,
     job_name VARCHAR,
     start DATETIME,
     end DATETIME,
@@ -14,14 +12,16 @@ CREATE TABLE jobs (
     log_hash, job_id PRIMARY KEY
 )
 
+CREATE TABLE logs (
+
+)
+
 -- The table containing all files. Each file can have multiple logs associated with
 -- it (we may reuse input files in different jobs, for example). 
--- 
+-- We use the generated file ID as the primary key because the chance of a collision is extremely low.
 CREATE TABLE files (
-    log_hash VARCHAR,
-    id UBIGINT,
-    path VARCHAR,
-    mount VARCHAR,
+    file_id UBIGINT PRIMARY KEY,
+    path VARCHAR
 )
 
 -- POSIX values can be set to -1 if the value was unable to be collected. So, we're
@@ -29,8 +29,8 @@ CREATE TABLE files (
 -- in the POSIX module of the darshan log.
 -- Rows in the posix table need to be associated with an existing file. 
 CREATE TABLE posix (
-    log_hash VARCHAR,
-    id UBIGINT,
+    row_id INT AUTO_INCREMENT PRIMARY KEY,
+    file_id UBIGINT,
     rank INTEGER,
     posix_opens BIGINT,
     posix_filenos BIGINT,

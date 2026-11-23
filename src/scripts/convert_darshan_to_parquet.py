@@ -2,17 +2,28 @@ import argparse
 import logging
 
 import darshan
+from darshan.backend import cffi_backend as darshan_backend
 import pandas
 import pyarrow
 import pyarrow.parquet
-
 
 from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
 
-DXT_MODULES = {"DXT_POSIX", "DXT_MPIIO"}
+SUPPORTED_MODULES = {"POSIX", "STDIO", "LUSTRE", "HEATMAP"}
+SUPPORTED_DXT_MODULES = {"DXT_POSIX", "DXT_MPIIO"}
+
+
+def _file_paths_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
+    """Name records: one row per record ``id`` with its file path, to join against modules."""
+    report.read_name_records()
+    names = report.name_records
+    return pyarrow.table({
+        "id": pyarrow.array(list(names.keys()), type=pyarrow.uint64()),
+        "path": pyarrow.array(list(names.values()), type=pyarrow.string()),
+    })
 
 
 def _module_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Table:
@@ -36,7 +47,6 @@ def _dxt_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Table:
     columns = {
         "id": [],
         "rank": [],
-        "hostname": [],
         "operation": [],
         "segment": [],
         "offset": [],
@@ -52,7 +62,6 @@ def _dxt_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Table:
             for segment, seg in enumerate(rec[f"{operation}_segments"]):
                 columns["id"].append(rec["id"])
                 columns["rank"].append(rec["rank"])
-                columns["hostname"].append(rec["hostname"])
                 columns["operation"].append(operation)
                 columns["segment"].append(segment)
                 columns["offset"].append(seg["offset"])
@@ -111,8 +120,13 @@ def _heatmap_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
 
 def _lustre_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
     """LUSTRE: one row per file stripe component."""
-    report.mod_read_all_lustre_records(dtype="pandas", warnings=False)
-    df = report.records["LUSTRE"][0]["components"]
+    # pydarshan's dtype="pandas" combines the per-record frames itself, but their "id"
+    # columns mix int64/uint64 and get promoted to float64, corrupting the ids. Read
+    # the records individually and normalise "id" to uint64 before combining.
+    frames = []
+    while (rec := darshan_backend.log_get_record(report.log, "LUSTRE", dtype="pandas")) is not None:
+        frames.append(rec["components"].astype({"id": "uint64"}))
+    df = pandas.concat(frames, ignore_index=True)
     return pyarrow.Table.from_pandas(df, preserve_index=False)
 
 
@@ -124,10 +138,12 @@ def _job_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
     metadata = job.pop("metadata", {}) or {}
     row = {key: [value] for key, value in job.items()}
     row["exe"] = [report.metadata.get("exe")]
-    row["metadata"] = pyarrow.array(
-        [[(str(k), str(v)) for k, v in metadata.items()]],
-        type=pyarrow.map_(pyarrow.string(), pyarrow.string()),
-    )
+
+    for k, v in metadata.items():
+        row[str(k)] = pyarrow.array(
+            [str(v)], type=pyarrow.string()
+        )
+
     return pyarrow.table(row)
 
 
@@ -137,11 +153,12 @@ def _write(table: pyarrow.Table, path: Path, name: str) -> None:
 
 
 def convert_log(log: Path, output_dir: Path | None = None) -> dict[str, Path]:
-    """Convert a darshan log into one parquet file per module, plus the job metadata.
+    """Convert a darshan log into one parquet file per module, plus the job metadata
+    and a record id -> file path mapping.
 
-    Files are written to ``output_dir/<MODULE>.parquet`` and ``output_dir/JOB.parquet``
-    (default: ``./<log stem>/``). Returns a mapping of module name (or ``"JOB"``) to
-    written file.
+    Files are written to ``output_dir/<MODULE>.parquet``, ``output_dir/JOB.parquet`` and
+    ``output_dir/FILE_PATHS.parquet`` (default: ``./<log stem>/``). Returns a mapping of
+    module name (or ``"JOB"`` / ``"FILES"``) to written file.
     """
     log = Path(log)
     output_dir = Path(output_dir) if output_dir is not None else Path.cwd() / log.stem
@@ -149,22 +166,32 @@ def convert_log(log: Path, output_dir: Path | None = None) -> dict[str, Path]:
 
     written = {}
     with darshan.DarshanReport(str(log), read_all=False) as report:
+        path = output_dir / "FILES.parquet"
+        _write(_file_paths_to_table(report), path, "FILES")
+        written["FILES"] = path
+
         path = output_dir / "JOB.parquet"
         _write(_job_to_table(report), path, "JOB")
         written["JOB"] = path
 
         for module in report.modules:
-            if module in DXT_MODULES:
+            table = None # init
+
+            if module in SUPPORTED_DXT_MODULES:
                 table = _dxt_to_table(report, module)
-            elif module == "HEATMAP":
-                table = _heatmap_to_table(report)
-            elif module == "LUSTRE":
-                table = _lustre_to_table(report)
-            elif module in ("APMPI", "APXC"):
+            elif module in SUPPORTED_MODULES:
+                if module == "HEATMAP":
+                    table = _heatmap_to_table(report)
+                elif module == "LUSTRE":
+                    table = _lustre_to_table(report)
+                else:
+                    table = _module_to_table(report, module)
+            else:
                 logger.warning("Skipping unsupported module %s in %s", module, log)
                 continue
-            else:
-                table = _module_to_table(report, module)
+
+            if not table: # we should always fail if a module passes every check but no table is created.
+                raise Exception(f"Something went wrong. Could not create table for module: {module}")
 
             path = output_dir / f"{module}.parquet"
             _write(table, path, module)
@@ -174,7 +201,9 @@ def convert_log(log: Path, output_dir: Path | None = None) -> dict[str, Path]:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__ or "Convert darshan logs to parquet files. Each module is split into its own parquet file. This is an adjustment step towards converting darshan files into a warehouse/datalakehouse-friendly format.")
+    parser = argparse.ArgumentParser(
+        description=__doc__ or "Convert darshan logs to parquet files. Each module is split into its own parquet file. This is an adjustment step towards converting darshan files into a warehouse/datalakehouse-friendly format."
+    )
     parser.add_argument("log_directory", type=Path, help="Root directory of all darshan log files.")
     parser.add_argument(
         "-o", "--output-dir", type=Path, default=Path.cwd(),
