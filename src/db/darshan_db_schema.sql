@@ -1,19 +1,28 @@
 CREATE TABLE jobs (
-    jobid BIGINT PRIMARY KEY,
-    job_name VARCHAR,
-    start DATETIME,
-    end DATETIME,
-    runtime TIME,
-    nthreads INTEGER,
+    uuid BINARY(16) PRIMARY KEY, -- this needs to be generated via python
+    user VARCHAR,
+    start_time_sec BIGINT, -- start time unix epoch 
+    start_time_nsec BIGINT,
+    end_time_sec BIGINT, -- end time unix epoch
+    end_time_nset BIGINT,
     nprocs INTEGER,
-    lib_ver VARCHAR,
-    cb_nodes INTEGER,
-    exe varchar,
-    log_hash, job_id PRIMARY KEY
+    job_id BIGINT, -- unix job ids aren't unique
+    run_time DOUBLE, -- darshan stores run time as a Float64.
+    exe VARCHAR,
+    arguments VARCHAR
 )
 
 CREATE TABLE logs (
-
+    uuid BINARY(16) PRIMARY KEY,
+    job_uuid BINARY(16),
+    hash UBIGINT,
+    pid INTEGER,
+    parent_pid INTEGER,
+    posix_size UBIGINT,
+    sdtio_size UBIGINT,
+    posix_dxt_size UBIGINT,
+    mpi_dxt_size UBIGINT,
+    CONSTRAINT fk_logs_job_uuid FOREIGN KEY (job_uuid) REFERENCES jobs(uuid)
 )
 
 -- The table containing all files. Each file can have multiple logs associated with
@@ -29,8 +38,8 @@ CREATE TABLE files (
 -- in the POSIX module of the darshan log.
 -- Rows in the posix table need to be associated with an existing file. 
 CREATE TABLE posix (
-    row_id INT AUTO_INCREMENT PRIMARY KEY,
     file_id UBIGINT,
+    log_uuid BINARY(16),
     rank INTEGER,
     posix_opens BIGINT,
     posix_filenos BIGINT,
@@ -117,11 +126,13 @@ CREATE TABLE posix (
     posix_f_slowest_rank_time TIME,
     posix_f_variance_rank_time TIME,
     posix_f_variance_rank_bytes BIGINT,
+    CONSTRAINT fk_posix_file_id FOREIGN KEY (file_id) REFERENCES files(file_id),
+    CONSTRAINT fk_posix_log_uuid FOREIGN KEY (log_uuid) REFERENCES logs(log_uuid)
 )
 
 CREATE TABLE stdio (
-    log_hash VARCHAR,
-    id UBIGINT,
+    row_id INT AUTO_INCREMENT PRIMARY KEY,
+    file_id UBIGINT,
     rank INTEGER,
     stdio_opens BIGINT,
     stdio_fdopens BIGINT,
@@ -154,10 +165,15 @@ CREATE TABLE stdio (
     stdio_f_slowest_rank_time TIME,
     stdio_f_variance_rank_time TIME,
     stdio_f_variance_rank_bytes BIGINT,
+    CONSTRAINT fk_stdio_file_id FOREIGN KEY (file_id) REFERENCES files(file_id)
 )
 
 CREATE TABLE dxt (
-    modulde VARCHAR,
+    row_id INT AUTO_INCREMENT PRIMARY KEY,
+    module VARCHAR,
+    file_id UBIGINT,
+    rank INTEGER,
+    module VARCHAR,
     rank INTEGER,
     operation VARCHAR,
     segment INTEGER,
@@ -166,4 +182,5 @@ CREATE TABLE dxt (
     start TIME(3),
     end TIME(3),
     pthreadid BIGINT,
+    CONSTRAINT fk_dxt_file_id FOREIGN KEY (file_id) REFERENCES files(file_id)
 )

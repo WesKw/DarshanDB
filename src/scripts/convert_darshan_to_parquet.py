@@ -1,5 +1,8 @@
 import argparse
 import logging
+import datetime
+import uuid
+import re
 
 import darshan
 from darshan.backend import cffi_backend as darshan_backend
@@ -15,9 +18,35 @@ logger = logging.getLogger(__name__)
 SUPPORTED_MODULES = {"POSIX", "STDIO", "LUSTRE", "HEATMAP"}
 SUPPORTED_DXT_MODULES = {"DXT_POSIX", "DXT_MPIIO"}
 
+ # we need this in order to track logs. We might get logs that are out of order
+ # It's possible that there will be overlapping IDs. 
+PID_MAPPING = {}
+
+
+def get_job_uuid(log: Path) -> uuid.UUID:
+    """Gets or generates a UUID for a job. Repeat PIDs across multiple logs all have the same parent
+    process, so they're all a part of the same job. The chances a PID being reused across multiple logs
+    is pretty low, but not impossible."""
+    pids = re.findall(r"id\d+-\d+_", log.name)[0] # guaranteed in log file name
+    parent_pid = pids.replace("id", "").split("-")[0]
+    child_pid = pids.replace("id", "").split("-")[1].replace("_", "")
+    if parent_pid not in PID_MAPPING:
+        PID_MAPPING[parent_pid] = uuid.uuid7() # generate a unique job id as the primary key in a db
+    job_uuid = PID_MAPPING[parent_pid]
+
+    return job_uuid
+
+
+def _logs_to_table(report: darshan.DarshanReport, log_uuid: uuid.UUID, job_uuid: uuid.UUID) -> pyarrow.Table:
+    """Generates a table with log-specific metadata. That way we can directly tie log files to 
+    traced files for each job and quick querying of workers for each job."""
+    ...
+
 
 def _file_paths_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
     """Name records: one row per record ``id`` with its file path, to join against modules."""
+    # todo:: Need to check if file already exists in the parquet files but contains a different
+    #        path. The chance of this is extremely unlikely but not impossible.
     report.read_name_records()
     names = report.name_records
     return pyarrow.table({
@@ -26,7 +55,7 @@ def _file_paths_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
     })
 
 
-def _module_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Table:
+def _module_to_table(report: darshan.DarshanReport, module: str, log_uuid: uuid.UUID) -> pyarrow.Table:
     """Counter based modules (POSIX, STDIO, MPI-IO, ...): one row per (record, rank)."""
     report.mod_read_all_records(module, dtype="numpy", warnings=False)
     dfs = report.records[module].to_df()
@@ -39,7 +68,7 @@ def _module_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Tabl
     return pyarrow.Table.from_pandas(df, preserve_index=False)
 
 
-def _dxt_to_table(report: darshan.DarshanReport, module: str) -> pyarrow.Table:
+def _dxt_to_table(report: darshan.DarshanReport, module: str, log_uuid: uuid.UUID) -> pyarrow.Table:
     """DXT modules: exploded so that every read/write operation is its own row."""
     report.mod_read_all_dxt_records(module, dtype="dict", warnings=False)
     records = report.records[module]
@@ -137,12 +166,19 @@ def _job_to_table(report: darshan.DarshanReport) -> pyarrow.Table:
     # logs, so it is kept as a map column to keep the schema stable.
     metadata = job.pop("metadata", {}) or {}
     row = {key: [value] for key, value in job.items()}
-    row["exe"] = [report.metadata.get("exe")]
 
-    for k, v in metadata.items():
-        row[str(k)] = pyarrow.array(
-            [str(v)], type=pyarrow.string()
-        )
+    # save row as a string to easily convert to a db
+    row["metadata"] = pyarrow.array(
+        [";".join(f"{k}={v}" for k, v in metadata.items())], type=pyarrow.string()
+    )
+
+    # ATLAS-specific job things.
+    try:
+        exe_split = report.metadata.get("exe").split()
+        row["exe"] = [exe_split[0]]
+        row["arguments"] = [" ".join(exe_split[1:])]
+    except:
+        raise ValueError("Could not get exe from darshan log.")
 
     return pyarrow.table(row)
 
@@ -164,8 +200,17 @@ def convert_log(log: Path, output_dir: Path | None = None) -> dict[str, Path]:
     output_dir = Path(output_dir) if output_dir is not None else Path.cwd() / log.stem
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # generate UUIDs for logs and jobs.
+    job_uuid = get_job_uuid(log) # generate a unique job id as the primary key in a db
+
+    # generating a uuid for the log is simple.
+    log_uuid = uuid.uuid7() # generate a unique log id as the primary key in a db
+
     written = {}
     with darshan.DarshanReport(str(log), read_all=False) as report:
+        # write log file metadata
+        table = _logs_to_table(report, log_uuid, job_uuid)
+
         path = output_dir / "FILES.parquet"
         _write(_file_paths_to_table(report), path, "FILES")
         written["FILES"] = path
@@ -178,14 +223,14 @@ def convert_log(log: Path, output_dir: Path | None = None) -> dict[str, Path]:
             table = None # init
 
             if module in SUPPORTED_DXT_MODULES:
-                table = _dxt_to_table(report, module)
+                table = _dxt_to_table(report, module, log_uuid)
             elif module in SUPPORTED_MODULES:
                 if module == "HEATMAP":
                     table = _heatmap_to_table(report)
                 elif module == "LUSTRE":
                     table = _lustre_to_table(report)
                 else:
-                    table = _module_to_table(report, module)
+                    table = _module_to_table(report, module, log_uuid)
             else:
                 logger.warning("Skipping unsupported module %s in %s", module, log)
                 continue
